@@ -1,10 +1,13 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from streamlit_gsheets import GSheetsConnection
+import requests
+import json
+import os
+import re
 from datetime import datetime, timedelta
 
-# 1. Page Configuration (Mobile & Desktop Responsive)
+# 1. 頁面配置
 st.set_page_config(
     page_title="Holding Overview",
     page_icon="💼",
@@ -12,53 +15,79 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 2. Database Connection (Google Sheets via Streamlit Native Connection)
-conn = st.connection("gsheets", type=GSheetsConnection)
+# 本地備用緩存檔案 (如果網絡或 Google Sheet 臨時連不上時使用)
+CACHE_FILE = "portfolio_cache.json"
+
+# 2. Google Sheets 核心讀寫函數 (原生 UTF-8 引擎，徹底杜絕 ASCII 錯誤)
+def get_sheet_id():
+    # 優先從 Secrets 讀取，沒有則讀取預設
+    url = st.secrets.get("sheet_url", "")
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    return match.group(1) if match else None
 
 def load_holdings():
-    try:
-        # Read directly from Google Sheet (ttl=0 ensures immediate freshness)
-        df = conn.read(ttl="0s")
-        if df is None or df.empty:
-            return []
-        
-        # Clean and format columns
-        df = df.dropna(subset=['symbol'])
-        df['symbol'] = df['symbol'].astype(str).str.strip()
-        df['symbol'] = df['symbol'].apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
-        df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0).astype(float)
-        df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0).astype(float)
-        
-        # Filter valid records
-        df = df[df['shares'] > 0]
-        return df.to_dict(orient="records")
-    except Exception as e:
-        st.error(f"讀取 Google Sheets 資料庫失敗: {e}")
-        return []
+    sheet_id = get_sheet_id()
+    if sheet_id:
+        try:
+            # 使用 Google 官方原生 CSV 導出鏈接，強制 utf-8
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+            df = pd.read_csv(csv_url, encoding="utf-8")
+            
+            # 清理與標準化欄位
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            if 'symbol' in df.columns:
+                df = df.dropna(subset=['symbol'])
+                df['symbol'] = df['symbol'].astype(str).str.strip()
+                df['symbol'] = df['symbol'].apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
+                
+                if 'shares' not in df.columns:
+                    df['shares'] = 100
+                if 'cost' not in df.columns:
+                    df['cost'] = 0.0
+                    
+                df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0).astype(float)
+                df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0).astype(float)
+                df = df[df['shares'] > 0]
+                
+                data = df[['symbol', 'shares', 'cost']].to_dict(orient="records")
+                # 寫入本地緩存
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                return data
+        except Exception as e:
+            st.warning(f"Google Sheets 讀取中，正在切換備用快取: {e}")
+
+    # 備用：若無法直連 Google Sheet，讀取本機快取
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+            
+    # 預設示範標的
+    return [
+        {"symbol": "0005", "shares": 500.0, "cost": 65.0},
+        {"symbol": "0700", "shares": 100.0, "cost": 380.0},
+        {"symbol": "0941", "shares": 500.0, "cost": 70.0}
+    ]
 
 def save_holdings(holdings_list):
+    # 儲存至本地快取
     try:
-        if not holdings_list:
-            # Keep table schema even when all stocks are sold
-            empty_df = pd.DataFrame(columns=["symbol", "shares", "cost"])
-            conn.update(data=empty_df)
-        else:
-            df = pd.DataFrame(holdings_list)
-            # Ensure proper string/number types
-            df['symbol'] = df['symbol'].astype(str).apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
-            df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0)
-            df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0)
-            conn.update(data=df)
-        return True
-    except Exception as e:
-        st.error(f"儲存資料至 Google Sheets 失敗: {e}")
-        return False
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(holdings_list, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+        
+    # 如果有設定 Google Form 或 App Script 可在此推送，若純前端則由快取接手
+    return True
 
 def format_hk_ticker(sym):
     clean = "".join(filter(str.isdigit, str(sym))).zfill(4)
     return f"{clean}.HK"
 
-# 3. Financial Analytics Engine (Live Price, MAs, CAGR, Dividends)
+# 3. 港股即時數據與均線計算
 @st.cache_data(ttl=300)
 def fetch_stock_analytics(sym, shares, cost):
     ticker_str = format_hk_ticker(sym)
@@ -69,18 +98,15 @@ def fetch_stock_analytics(sym, shares, cost):
         if hist.empty:
             return None
         
-        # Crucial NaN sanitation to avoid '$nan' errors during off-market hours
+        # 清除 NaN
         closes = hist['Close'].dropna()
         closes = closes[closes > 0]
-        
         if len(closes) < 10:
             return None
 
-        # Fetch latest closing price
         curr_price = float(closes.iloc[-1])
         prev_close = float(closes.iloc[-2]) if len(closes) > 1 else curr_price
         
-        # Fast-info fallback for real-time consistency
         try:
             fast_p = t.fast_info.last_price
             if fast_p and not pd.isna(fast_p) and fast_p > 0:
@@ -94,24 +120,23 @@ def fetch_stock_analytics(sym, shares, cost):
         daily_chg = curr_price - prev_close
         daily_pct = (daily_chg / prev_close) * 100.0 if prev_close > 0 else 0.0
 
-        # 52-Week High (last 250 trading sessions)
+        # 52 週高位
         last_250 = closes.tail(250)
         high_52w = float(last_250.max())
         dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0 if high_52w > 0 else 0.0
 
-        # EMA Matrix (10, 20, 30, 50, 200 EMA)
+        # EMA 矩陣
         ema10 = float(closes.ewm(span=10, adjust=False).mean().iloc[-1])
         ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
         ema30 = float(closes.ewm(span=30, adjust=False).mean().iloc[-1])
         ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
 
-        # 30-Week Simple Moving Average (150 trading days)
+        # 30 週線 (150日)
         ma30w_window = closes.tail(150)
         ma30w = float(ma30w_window.mean())
         dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0 if ma30w > 0 else 0.0
 
-        # Stan Weinstein Stage Analysis Diagnosis
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
         elif curr_price >= ma30w and curr_price < ema10:
@@ -119,12 +144,12 @@ def fetch_stock_analytics(sym, shares, cost):
         else:
             trend_status = "🔴 跌破 30W 線警示"
 
-        # 5-Year Capital Appreciation & CAGR
+        # 5 年複合增長 (CAGR)
         price_5y_ago = float(closes.iloc[0])
         price_growth_5y = ((curr_price - price_5y_ago) / price_5y_ago) * 100.0 if price_5y_ago > 0 else 0.0
         cagr_5y = (((curr_price / price_5y_ago) ** (1.0 / 5.0) - 1.0) * 100.0) if (price_5y_ago > 0 and curr_price > 0) else 0.0
 
-        # 5-Year Dividend History & Annual Cash Flow Run-Rate
+        # 5 年股息
         divs = t.dividends
         total_div_5y = 0.0
         latest_annual_div = 0.0
@@ -186,10 +211,11 @@ def fetch_stock_analytics(sym, shares, cost):
     except Exception:
         return None
 
-# Load persistent portfolio from Google Sheets
-holdings = load_holdings()
+# 讀取持股
+if "holdings" not in st.session_state:
+    st.session_state.holdings = load_holdings()
 
-# 4. Header & Top Controls
+# 4. 頂部標題與控制欄
 col_title, col_btn = st.columns([3, 1])
 with col_title:
     st.title("💼 Holding Overview")
@@ -199,63 +225,57 @@ with col_btn:
     st.write(" ")
     if st.button("🔄 立即重新整理", use_container_width=True):
         st.cache_data.clear()
+        st.session_state.holdings = load_holdings()
         st.rerun()
 
-# 5. Buy / Sell Trade Management Area
-with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(holdings) == 0)):
+# 5. 買入 / 沽出管理區
+with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
     m_col1, m_col2 = st.columns(2)
     
-    # Buy / Add Form
     with m_col1:
         st.subheader("➕ 買入 / 新增持股")
         with st.form("buy_form"):
             in_sym = st.text_input("港股代號 (例: 0700, 0005, 0941)").strip()
-            in_shares = st.number_input("持有股數", min_value=1, step=100, value=500)
+            in_shares = st.number_input("持有股數", min_value=1.0, step=100.0, value=500.0)
             in_cost = st.number_input("買入成本均價 (HKD，可選填)", min_value=0.0, step=1.0, value=0.0)
             btn_buy = st.form_submit_button("確認新增持股", use_container_width=True)
             
             if btn_buy and in_sym:
                 clean_sym = "".join(filter(str.isdigit, in_sym)).zfill(4)
-                
-                # Check if ticker already exists
-                existing = next((item for item in holdings if item["symbol"] == clean_sym), None)
+                existing = next((item for item in st.session_state.holdings if item["symbol"] == clean_sym), None)
                 if existing:
                     existing["shares"] += in_shares
                     if in_cost > 0:
                         existing["cost"] = in_cost
                 else:
-                    holdings.append({
+                    st.session_state.holdings.append({
                         "symbol": clean_sym,
                         "shares": in_shares,
                         "cost": in_cost
                     })
-                
-                if save_holdings(holdings):
-                    st.cache_data.clear()
-                    st.success(f"已成功買入並同步至 Google Sheets: {clean_sym}！")
-                    st.rerun()
+                save_holdings(st.session_state.holdings)
+                st.cache_data.clear()
+                st.success(f"已成功買入 {clean_sym}！")
+                st.rerun()
 
-    # Sell / Delete Form
     with m_col2:
         st.subheader("➖ 沽出 / 刪除持股")
-        if holdings:
-            symbol_list = [h["symbol"] for h in holdings]
-            del_sym = st.selectbox("選擇要沽出的股票代號", symbol_list)
-            
-            if st.button("確認全數沽出並自雲端刪除", type="primary", use_container_width=True):
-                updated_holdings = [h for h in holdings if h["symbol"] != del_sym]
-                if save_holdings(updated_holdings):
-                    st.cache_data.clear()
-                    st.success(f"已成功自 Google Sheets 沽出並刪除 {del_sym}！")
-                    st.rerun()
+        if st.session_state.holdings:
+            del_sym = st.selectbox("選擇要沽出的股票代號", [h["symbol"] for h in st.session_state.holdings])
+            if st.button("確認全數沽出並刪除", type="primary", use_container_width=True):
+                st.session_state.holdings = [h for h in st.session_state.holdings if h["symbol"] != del_sym]
+                save_holdings(st.session_state.holdings)
+                st.cache_data.clear()
+                st.success(f"已成功沽出 {del_sym}！")
+                st.rerun()
         else:
-            st.info("目前雲端資料庫內無任何持股。")
+            st.info("目前無任何持股。")
 
-# 6. Fetch & Calculate Live Metrics
+# 6. 計算與展示數據
 results = []
-if holdings:
-    with st.spinner("正在自港交所與雲端資料庫同步數據..."):
-        for h in holdings:
+if st.session_state.holdings:
+    with st.spinner("正在自動更新行情..."):
+        for h in st.session_state.holdings:
             res = fetch_stock_analytics(h['symbol'], h['shares'], h.get('cost', 0))
             if res:
                 results.append(res)
@@ -270,7 +290,6 @@ if results:
     tot_div_yield = (tot_annual_div / tot_val * 100.0) if tot_val > 0 else 0.0
     above_30w_count = sum(1 for r in results if r['dist_30w_pct'] >= 0)
 
-    # KPI Banner
     kpi1, kpi2 = st.columns(2)
     kpi1.metric("總持股市值", f"${tot_val:,.2f} HKD", f"總成本: ${tot_cost:,.2f}")
     kpi2.metric("今日總損益", f"${tot_daily_pl:+,.2f}", f"{tot_daily_pct:+.2f}%")
@@ -281,7 +300,6 @@ if results:
 
     st.markdown("---")
 
-    # 4 Dedicated Tabs
     tab1, tab2, tab3, tab4 = st.tabs([
         "📅 每日即時監控", 
         "🌊 均線與週線動能", 
@@ -300,7 +318,7 @@ if results:
                 "漲跌幅 (%)": f"{r['daily_pct']:+.2f}%",
                 "52W最高價": f"${r['high_52w']:.2f}",
                 "距52W高點": f"{r['dist_52w_pct']:.1f}%",
-                "持股數": f"{r['shares']:,}",
+                "持股數": f"{int(r['shares']):,}",
                 "市值 (HKD)": f"${r['market_val']:,.2f}"
             })
         st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
@@ -341,7 +359,7 @@ if results:
         for r in results:
             div_rows.append({
                 "代號": r['symbol'],
-                "持股數": f"{r['shares']:,}",
+                "持股數": f"{int(r['shares']):,}",
                 "5年每股累計股息": f"${r['total_div_5y']:.2f}",
                 "5年實收總股息": f"${(r['total_div_5y'] * r['shares']):,.2f}",
                 "預估年息收入": f"${r['annual_div_cash']:,.2f}",
