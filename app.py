@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import requests
 import json
-import os
 import re
 from datetime import datetime, timedelta
 
@@ -15,79 +14,61 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 本地備用緩存檔案 (如果網絡或 Google Sheet 臨時連不上時使用)
-CACHE_FILE = "portfolio_cache.json"
-
-# 2. Google Sheets 核心讀寫函數 (原生 UTF-8 引擎，徹底杜絕 ASCII 錯誤)
+# 2. Google Sheets 雙向同步核心模組
 def get_sheet_id():
-    # 優先從 Secrets 讀取，沒有則讀取預設
-    url = st.secrets.get("sheet_url", "")
+    url = st.secrets.get("SHEET_URL", "")
     match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
     return match.group(1) if match else None
 
-def load_holdings():
+# 從 Google Sheet 即時讀取
+def load_holdings_from_gsheet():
     sheet_id = get_sheet_id()
-    if sheet_id:
-        try:
-            # 使用 Google 官方原生 CSV 導出鏈接，強制 utf-8
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-            df = pd.read_csv(csv_url, encoding="utf-8")
-            
-            # 清理與標準化欄位
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            if 'symbol' in df.columns:
-                df = df.dropna(subset=['symbol'])
-                df['symbol'] = df['symbol'].astype(str).str.strip()
-                df['symbol'] = df['symbol'].apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
-                
-                if 'shares' not in df.columns:
-                    df['shares'] = 100
-                if 'cost' not in df.columns:
-                    df['cost'] = 0.0
-                    
-                df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0).astype(float)
-                df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0).astype(float)
-                df = df[df['shares'] > 0]
-                
-                data = df[['symbol', 'shares', 'cost']].to_dict(orient="records")
-                # 寫入本地緩存
-                with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False)
-                return data
-        except Exception as e:
-            st.warning(f"Google Sheets 讀取中，正在切換備用快取: {e}")
-
-    # 備用：若無法直連 Google Sheet，讀取本機快取
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-            
-    # 預設示範標的
-    return [
-        {"symbol": "0005", "shares": 500.0, "cost": 65.0},
-        {"symbol": "0700", "shares": 100.0, "cost": 380.0},
-        {"symbol": "0941", "shares": 500.0, "cost": 70.0}
-    ]
-
-def save_holdings(holdings_list):
-    # 儲存至本地快取
+    if not sheet_id:
+        return []
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(holdings_list, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&id={sheet_id}&gid=0"
+        df = pd.read_csv(csv_url, encoding="utf-8")
+        df.columns = [str(c).strip().lower() for c in df.columns]
         
-    # 如果有設定 Google Form 或 App Script 可在此推送，若純前端則由快取接手
-    return True
+        if 'symbol' in df.columns:
+            df = df.dropna(subset=['symbol'])
+            df['symbol'] = df['symbol'].astype(str).str.strip()
+            df['symbol'] = df['symbol'].apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
+            
+            if 'shares' not in df.columns: df['shares'] = 0.0
+            if 'cost' not in df.columns: df['cost'] = 0.0
+            
+            df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0).astype(float)
+            df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0).astype(float)
+            df = df[df['shares'] > 0]
+            
+            return df[['symbol', 'shares', 'cost']].to_dict(orient="records")
+    except Exception as e:
+        st.warning(f"讀取 Google Sheet 提示: {e}")
+    return []
+
+# 將最新持股寫入 Google Sheet (永久保存)
+def save_holdings_to_gsheet(holdings_list):
+    api_url = st.secrets.get("WRITE_API", "")
+    if not api_url:
+        st.error("請先在 Streamlit Secrets 設定 WRITE_API！")
+        return False
+    try:
+        payload = {
+            "action": "sync_all",
+            "holdings": holdings_list
+        }
+        res = requests.post(api_url, json=payload, timeout=10)
+        return res.status_code == 200
+    except Exception as e:
+        st.error(f"同步至 Google Sheet 失敗: {e}")
+        return False
 
 def format_hk_ticker(sym):
     clean = "".join(filter(str.isdigit, str(sym))).zfill(4)
     return f"{clean}.HK"
 
-# 3. 港股即時數據與均線計算
+# 3. 港股行情、均線矩陣與派息計算
 @st.cache_data(ttl=300)
 def fetch_stock_analytics(sym, shares, cost):
     ticker_str = format_hk_ticker(sym)
@@ -98,7 +79,6 @@ def fetch_stock_analytics(sym, shares, cost):
         if hist.empty:
             return None
         
-        # 清除 NaN
         closes = hist['Close'].dropna()
         closes = closes[closes > 0]
         if len(closes) < 10:
@@ -120,7 +100,6 @@ def fetch_stock_analytics(sym, shares, cost):
         daily_chg = curr_price - prev_close
         daily_pct = (daily_chg / prev_close) * 100.0 if prev_close > 0 else 0.0
 
-        # 52 週高位
         last_250 = closes.tail(250)
         high_52w = float(last_250.max())
         dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0 if high_52w > 0 else 0.0
@@ -149,7 +128,7 @@ def fetch_stock_analytics(sym, shares, cost):
         price_growth_5y = ((curr_price - price_5y_ago) / price_5y_ago) * 100.0 if price_5y_ago > 0 else 0.0
         cagr_5y = (((curr_price / price_5y_ago) ** (1.0 / 5.0) - 1.0) * 100.0) if (price_5y_ago > 0 and curr_price > 0) else 0.0
 
-        # 5 年股息
+        # 5 年股息現金流
         divs = t.dividends
         total_div_5y = 0.0
         latest_annual_div = 0.0
@@ -211,24 +190,24 @@ def fetch_stock_analytics(sym, shares, cost):
     except Exception:
         return None
 
-# 讀取持股
+# 初始化載入 Google Sheets
 if "holdings" not in st.session_state:
-    st.session_state.holdings = load_holdings()
+    st.session_state.holdings = load_holdings_from_gsheet()
 
 # 4. 頂部標題與控制欄
 col_title, col_btn = st.columns([3, 1])
 with col_title:
     st.title("💼 Holding Overview")
-    st.caption("雲端資料庫同步 • 港股即時均線 • 5年股息與動能")
+    st.caption("Google Sheets 雲端即時同步 • 港股動能矩陣 • 5年股息")
 
 with col_btn:
     st.write(" ")
     if st.button("🔄 立即重新整理", use_container_width=True):
         st.cache_data.clear()
-        st.session_state.holdings = load_holdings()
+        st.session_state.holdings = load_holdings_from_gsheet()
         st.rerun()
 
-# 5. 買入 / 沽出管理區
+# 5. 買入 / 沽出管理區 (操作即自動永久寫入 Google Sheet)
 with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
     m_col1, m_col2 = st.columns(2)
     
@@ -238,7 +217,7 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
             in_sym = st.text_input("港股代號 (例: 0700, 0005, 0941)").strip()
             in_shares = st.number_input("持有股數", min_value=1.0, step=100.0, value=500.0)
             in_cost = st.number_input("買入成本均價 (HKD，可選填)", min_value=0.0, step=1.0, value=0.0)
-            btn_buy = st.form_submit_button("確認新增持股", use_container_width=True)
+            btn_buy = st.form_submit_button("確認新增並存入雲端", use_container_width=True)
             
             if btn_buy and in_sym:
                 clean_sym = "".join(filter(str.isdigit, in_sym)).zfill(4)
@@ -253,28 +232,31 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
                         "shares": in_shares,
                         "cost": in_cost
                     })
-                save_holdings(st.session_state.holdings)
-                st.cache_data.clear()
-                st.success(f"已成功買入 {clean_sym}！")
-                st.rerun()
+                
+                with st.spinner("正在永久存入 Google Sheets..."):
+                    if save_holdings_to_gsheet(st.session_state.holdings):
+                        st.cache_data.clear()
+                        st.success(f"已成功買入並同步至 Google Sheet: {clean_sym}！")
+                        st.rerun()
 
     with m_col2:
         st.subheader("➖ 沽出 / 刪除持股")
         if st.session_state.holdings:
             del_sym = st.selectbox("選擇要沽出的股票代號", [h["symbol"] for h in st.session_state.holdings])
-            if st.button("確認全數沽出並刪除", type="primary", use_container_width=True):
+            if st.button("確認全數沽出並自雲端移除", type="primary", use_container_width=True):
                 st.session_state.holdings = [h for h in st.session_state.holdings if h["symbol"] != del_sym]
-                save_holdings(st.session_state.holdings)
-                st.cache_data.clear()
-                st.success(f"已成功沽出 {del_sym}！")
-                st.rerun()
+                with st.spinner("正在從 Google Sheets 刪除..."):
+                    if save_holdings_to_gsheet(st.session_state.holdings):
+                        st.cache_data.clear()
+                        st.success(f"已成功自 Google Sheet 沽出: {del_sym}！")
+                        st.rerun()
         else:
-            st.info("目前無任何持股。")
+            st.info("目前 Google Sheet 內無持股。")
 
 # 6. 計算與展示數據
 results = []
 if st.session_state.holdings:
-    with st.spinner("正在自動更新行情..."):
+    with st.spinner("正在自動更新即時行情與均線..."):
         for h in st.session_state.holdings:
             res = fetch_stock_analytics(h['symbol'], h['shares'], h.get('cost', 0))
             if res:
@@ -368,4 +350,4 @@ if results:
             })
         st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
 else:
-    st.info("目前資料庫內尚無持股。請展開上方的「買入 / 沽出持股管理」輸入您的第一檔港股。")
+    st.info("目前 Google Sheet 資料庫內無持股。請展開上方「買入 / 沽出持股管理」輸入您的第一檔港股。")
