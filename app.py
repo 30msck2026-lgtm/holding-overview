@@ -16,8 +16,8 @@ st.set_page_config(
 DATA_FILE = "portfolio_data.json"
 
 DEFAULT_HOLDINGS = [
+    {"symbol": "0005", "shares": 500, "cost": 65.0},
     {"symbol": "0700", "shares": 100, "cost": 380.0},
-    {"symbol": "0005", "shares": 400, "cost": 65.0},
     {"symbol": "0941", "shares": 500, "cost": 70.0}
 ]
 
@@ -42,34 +42,58 @@ def format_hk_ticker(sym):
         clean = "0" + clean
     return f"{clean}.HK"
 
+# 抓取數據 (加入 dropna 清洗 NaN 空值)
 @st.cache_data(ttl=300)
 def fetch_stock_analytics(sym, shares, cost):
     ticker_str = format_hk_ticker(sym)
     try:
         t = yf.Ticker(ticker_str)
         hist = t.history(period="5y", interval="1d")
-        if hist.empty or len(hist) < 10:
+        
+        if hist.empty:
             return None
         
-        closes = hist['Close']
+        # 關鍵修正：徹底過濾掉所有空值與無效數值 (解決 $nan 核心問題)
+        closes = hist['Close'].dropna()
+        closes = closes[closes > 0]
+        
+        if len(closes) < 10:
+            return None
+
+        # 取得最新收市價 (非交易時段自動取最後一筆有效收盤價)
         curr_price = float(closes.iloc[-1])
         prev_close = float(closes.iloc[-2]) if len(closes) > 1 else curr_price
-        daily_chg = curr_price - prev_close
-        daily_pct = (daily_chg / prev_close) * 100.0
+        
+        # 如果 yfinance fast_info 有即時價且非 NaN，優先採用
+        try:
+            fast_p = t.fast_info.last_price
+            if fast_p and not pd.isna(fast_p) and fast_p > 0:
+                curr_price = float(fast_p)
+                prev_p = t.fast_info.previous_close
+                if prev_p and not pd.isna(prev_p) and prev_p > 0:
+                    prev_close = float(prev_p)
+        except Exception:
+            pass
 
+        daily_chg = curr_price - prev_close
+        daily_pct = (daily_chg / prev_close) * 100.0 if prev_close > 0 else 0.0
+
+        # 52 週最高價
         last_250 = closes.tail(250)
         high_52w = float(last_250.max())
-        dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0
+        dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0 if high_52w > 0 else 0.0
 
+        # EMA 均線矩陣
         ema10 = float(closes.ewm(span=10, adjust=False).mean().iloc[-1])
         ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
         ema30 = float(closes.ewm(span=30, adjust=False).mean().iloc[-1])
         ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
 
+        # 30 週均線 (150 個交易日)
         ma30w_window = closes.tail(150)
         ma30w = float(ma30w_window.mean())
-        dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0
+        dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0 if ma30w > 0 else 0.0
 
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
@@ -78,33 +102,43 @@ def fetch_stock_analytics(sym, shares, cost):
         else:
             trend_status = "🔴 跌破 30W 線警示"
 
+        # 5 年複合增長 (CAGR)
         price_5y_ago = float(closes.iloc[0])
-        price_growth_5y = ((curr_price - price_5y_ago) / price_5y_ago) * 100.0
-        cagr_5y = ((curr_price / price_5y_ago) ** (1.0 / 5.0) - 1.0) * 100.0
+        price_growth_5y = ((curr_price - price_5y_ago) / price_5y_ago) * 100.0 if price_5y_ago > 0 else 0.0
+        cagr_5y = (((curr_price / price_5y_ago) ** (1.0 / 5.0) - 1.0) * 100.0) if (price_5y_ago > 0 and curr_price > 0) else 0.0
 
+        # 股息歷史
         divs = t.dividends
         total_div_5y = 0.0
         latest_annual_div = 0.0
         
-        if not divs.empty:
-            div_df = divs.reset_index()
+        if divs is not None and not divs.empty:
+            div_df = divs.dropna().reset_index()
+            # 兼容時間戳格式
             div_df['Date'] = pd.to_datetime(div_df['Date']).dt.tz_localize(None)
             cutoff_5y = datetime.now() - timedelta(days=5*365)
             cutoff_1y = datetime.now() - timedelta(days=365)
             
             div_5y = div_df[div_df['Date'] >= cutoff_5y]
-            total_div_5y = float(div_5y['Dividends'].sum())
+            if not div_5y.empty:
+                total_div_5y = float(div_5y['Dividends'].sum())
             
             div_1y = div_df[div_df['Date'] >= cutoff_1y]
-            latest_annual_div = float(div_1y['Dividends'].sum())
+            if not div_1y.empty:
+                latest_annual_div = float(div_1y['Dividends'].sum())
 
-        total_return_5y = ((curr_price - price_5y_ago + total_div_5y) / price_5y_ago) * 100.0
+        total_return_5y = ((curr_price - price_5y_ago + total_div_5y) / price_5y_ago) * 100.0 if price_5y_ago > 0 else 0.0
         annual_div_cash = latest_annual_div * shares
         div_yield = (latest_annual_div / curr_price * 100.0) if curr_price > 0 else 0.0
         yoc = (latest_annual_div / cost * 100.0) if cost > 0 else div_yield
         market_val = curr_price * shares
 
-        stock_name = t.info.get('shortName') or sym
+        # 取得公司名稱
+        stock_name = sym
+        try:
+            stock_name = t.fast_info.name or t.info.get('shortName') or sym
+        except Exception:
+            pass
 
         return {
             "symbol": sym,
@@ -117,11 +151,11 @@ def fetch_stock_analytics(sym, shares, cost):
             "market_val": market_val,
             "high_52w": high_52w,
             "dist_52w_pct": dist_52w_pct,
-            "ema10_pct": ((curr_price - ema10) / ema10) * 100.0,
-            "ema20_pct": ((curr_price - ema20) / ema20) * 100.0,
-            "ema30_pct": ((curr_price - ema30) / ema30) * 100.0,
-            "ema50_pct": ((curr_price - ema50) / ema50) * 100.0,
-            "ema200_pct": ((curr_price - ema200) / ema200) * 100.0,
+            "ema10_pct": ((curr_price - ema10) / ema10) * 100.0 if ema10 > 0 else 0.0,
+            "ema20_pct": ((curr_price - ema20) / ema20) * 100.0 if ema20 > 0 else 0.0,
+            "ema30_pct": ((curr_price - ema30) / ema30) * 100.0 if ema30 > 0 else 0.0,
+            "ema50_pct": ((curr_price - ema50) / ema50) * 100.0 if ema50 > 0 else 0.0,
+            "ema200_pct": ((curr_price - ema200) / ema200) * 100.0 if ema200 > 0 else 0.0,
             "ma30w": ma30w,
             "dist_30w_pct": dist_30w_pct,
             "trend_status": trend_status,
@@ -134,7 +168,7 @@ def fetch_stock_analytics(sym, shares, cost):
             "div_yield": div_yield,
             "yoc": yoc
         }
-    except Exception:
+    except Exception as e:
         return None
 
 if "holdings" not in st.session_state:
@@ -152,14 +186,14 @@ with col_btn:
         st.cache_data.clear()
         st.rerun()
 
-# 買入與沽出管理區（常駐於上方折疊選單中）
+# 買入與沽出管理區
 with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
     m_col1, m_col2 = st.columns(2)
     with m_col1:
         st.subheader("➕ 買入 / 新增持股")
         with st.form("add_form"):
             in_sym = st.text_input("港股代號 (例: 0700, 0005, 0941)").strip()
-            in_shares = st.number_input("持有股數", min_value=1, step=100, value=100)
+            in_shares = st.number_input("持有股數", min_value=1, step=100, value=500)
             in_cost = st.number_input("買入成本均價 (HKD，可留空)", min_value=0.0, step=1.0, value=0.0)
             btn_submit = st.form_submit_button("確認新增持股", use_container_width=True)
             
@@ -197,9 +231,9 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
         else:
             st.info("暫無可沽出標的")
 
-# 抓取並運算數據
+# 抓取數據
 results = []
-with st.spinner("正在自動連線更新行情..."):
+with st.spinner("正在自動更新行情..."):
     for h in st.session_state.holdings:
         res = fetch_stock_analytics(h['symbol'], h['shares'], h.get('cost', 0))
         if res:
@@ -293,4 +327,4 @@ if results:
             })
         st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
 else:
-    st.info("請點擊上方的「⚙️ 買入 / 沽出持股管理」輸入你的第一檔港股。")
+    st.info("資料讀取中或請展開上方「買入 / 沽出持股管理」新增持股。")
