@@ -14,13 +14,12 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# 2. Google Sheets 雙向同步核心模組
+# 2. Google Sheets 核心讀寫模組
 def get_sheet_id():
     url = st.secrets.get("SHEET_URL", "")
     match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
     return match.group(1) if match else None
 
-# 從 Google Sheet 即時讀取
 def load_holdings_from_gsheet():
     sheet_id = get_sheet_id()
     if not sheet_id:
@@ -35,8 +34,10 @@ def load_holdings_from_gsheet():
             df['symbol'] = df['symbol'].astype(str).str.strip()
             df['symbol'] = df['symbol'].apply(lambda x: "".join(filter(str.isdigit, x)).zfill(4))
             
-            if 'shares' not in df.columns: df['shares'] = 0.0
-            if 'cost' not in df.columns: df['cost'] = 0.0
+            if 'shares' not in df.columns:
+                df['shares'] = 0.0
+            if 'cost' not in df.columns:
+                df['cost'] = 0.0
             
             df['shares'] = pd.to_numeric(df['shares'], errors='coerce').fillna(0).astype(float)
             df['cost'] = pd.to_numeric(df['cost'], errors='coerce').fillna(0.0).astype(float)
@@ -47,7 +48,6 @@ def load_holdings_from_gsheet():
         st.warning(f"讀取 Google Sheet 提示: {e}")
     return []
 
-# 將最新持股寫入 Google Sheet (永久保存)
 def save_holdings_to_gsheet(holdings_list):
     api_url = st.secrets.get("WRITE_API", "")
     if not api_url:
@@ -68,7 +68,7 @@ def format_hk_ticker(sym):
     clean = "".join(filter(str.isdigit, str(sym))).zfill(4)
     return f"{clean}.HK"
 
-# 3. 港股行情、均線矩陣與派息計算
+# 3. 港股即時數據與均線計算引擎
 @st.cache_data(ttl=300)
 def fetch_stock_analytics(sym, shares, cost):
     ticker_str = format_hk_ticker(sym)
@@ -81,7 +81,7 @@ def fetch_stock_analytics(sym, shares, cost):
         
         closes = hist['Close'].dropna()
         closes = closes[closes > 0]
-        if len(closes) < 10:
+        if len(closes) < 160:
             return None
 
         curr_price = float(closes.iloc[-1])
@@ -104,18 +104,40 @@ def fetch_stock_analytics(sym, shares, cost):
         high_52w = float(last_250.max())
         dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0 if high_52w > 0 else 0.0
 
-        # EMA 矩陣
+        # 正確順序的 EMA 均線矩陣
         ema10 = float(closes.ewm(span=10, adjust=False).mean().iloc[-1])
         ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
         ema30 = float(closes.ewm(span=30, adjust=False).mean().iloc[-1])
         ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
 
-        # 30 週線 (150日)
+        # 30 週線 (150日) 即時數值
         ma30w_window = closes.tail(150)
         ma30w = float(ma30w_window.mean())
         dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0 if ma30w > 0 else 0.0
 
+        # --- 30W MA 動態走近/遠離 Indicator (設定 2.5% 中長線合理閾值) ---
+        past_closes = closes.iloc[:-10]
+        past_ma30w = float(past_closes.tail(150).mean())
+        past_price = float(past_closes.iloc[-1])
+        past_dist_30w_pct = ((past_price - past_ma30w) / past_ma30w) * 100.0
+
+        gap_diff = abs(dist_30w_pct) - abs(past_dist_30w_pct)
+        
+        if abs(gap_diff) <= 2.5:
+            ma30w_trend = "⏸️ 貼線平穩運行"
+        elif curr_price >= ma30w:
+            if gap_diff > 2.5:
+                ma30w_trend = "🚀 擴大遠離 (強勢多頭)"
+            else:
+                ma30w_trend = "🧲 回踩走近 (尋求支撐)"
+        else:
+            if gap_diff > 2.5:
+                ma30w_trend = "📉 破線下殺 (加速遠離)"
+            else:
+                ma30w_trend = "⤴️ 跌深反彈 (逼近30W)"
+
+        # 總體趨勢狀態
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
         elif curr_price >= ma30w and curr_price < ema10:
@@ -123,12 +145,10 @@ def fetch_stock_analytics(sym, shares, cost):
         else:
             trend_status = "🔴 跌破 30W 線警示"
 
-        # 5 年複合增長 (CAGR)
         price_5y_ago = float(closes.iloc[0])
         price_growth_5y = ((curr_price - price_5y_ago) / price_5y_ago) * 100.0 if price_5y_ago > 0 else 0.0
         cagr_5y = (((curr_price / price_5y_ago) ** (1.0 / 5.0) - 1.0) * 100.0) if (price_5y_ago > 0 and curr_price > 0) else 0.0
 
-        # 5 年股息現金流
         divs = t.dividends
         total_div_5y = 0.0
         latest_annual_div = 0.0
@@ -152,22 +172,21 @@ def fetch_stock_analytics(sym, shares, cost):
         div_yield = (latest_annual_div / curr_price * 100.0) if curr_price > 0 else 0.0
         yoc = (latest_annual_div / cost * 100.0) if cost > 0 else div_yield
         market_val = curr_price * shares
-
-        stock_name = sym
-        try:
-            stock_name = t.fast_info.name or t.info.get('shortName') or sym
-        except Exception:
-            pass
+        total_cost = cost * shares
+        holding_pl = market_val - total_cost
+        holding_pl_pct = (holding_pl / total_cost * 100.0) if total_cost > 0 else 0.0
 
         return {
             "symbol": sym,
-            "name": stock_name,
             "shares": shares,
             "cost": cost,
             "current_price": curr_price,
             "daily_chg": daily_chg,
             "daily_pct": daily_pct,
             "market_val": market_val,
+            "total_cost": total_cost,
+            "holding_pl": holding_pl,
+            "holding_pl_pct": holding_pl_pct,
             "high_52w": high_52w,
             "dist_52w_pct": dist_52w_pct,
             "ema10_pct": ((curr_price - ema10) / ema10) * 100.0 if ema10 > 0 else 0.0,
@@ -177,6 +196,7 @@ def fetch_stock_analytics(sym, shares, cost):
             "ema200_pct": ((curr_price - ema200) / ema200) * 100.0 if ema200 > 0 else 0.0,
             "ma30w": ma30w,
             "dist_30w_pct": dist_30w_pct,
+            "ma30w_trend": ma30w_trend,
             "trend_status": trend_status,
             "price_5y_ago": price_5y_ago,
             "price_growth_5y": price_growth_5y,
@@ -207,11 +227,11 @@ with col_btn:
         st.session_state.holdings = load_holdings_from_gsheet()
         st.rerun()
 
-# 5. 買入 / 沽出管理區 (操作即自動永久寫入 Google Sheet)
+# 5. 買入 / 沽出管理區
 with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
-    m_col1, m_col2 = st.columns(2)
+    top_col_left, top_col_right = st.columns(2)
     
-    with m_col1:
+    with top_col_left:
         st.subheader("➕ 買入 / 新增持股")
         with st.form("buy_form"):
             in_sym = st.text_input("港股代號 (例: 0700, 0005, 0941)").strip()
@@ -239,7 +259,7 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
                         st.success(f"已成功買入並同步至 Google Sheet: {clean_sym}！")
                         st.rerun()
 
-    with m_col2:
+    with top_col_right:
         st.subheader("➖ 沽出 / 刪除持股")
         if st.session_state.holdings:
             del_sym = st.selectbox("選擇要沽出的股票代號", [h["symbol"] for h in st.session_state.holdings])
@@ -264,21 +284,26 @@ if st.session_state.holdings:
 
 if results:
     tot_val = sum(r['market_val'] for r in results)
-    tot_cost = sum(r['cost'] * r['shares'] for r in results)
+    tot_cost = sum(r['total_cost'] for r in results)
+    tot_overall_pl = tot_val - tot_cost
+    tot_overall_pct = (tot_overall_pl / tot_cost * 100.0) if tot_cost > 0 else 0.0
+    
     tot_daily_pl = sum(r['daily_chg'] * r['shares'] for r in results)
     tot_prev_val = tot_val - tot_daily_pl
     tot_daily_pct = (tot_daily_pl / tot_prev_val * 100.0) if tot_prev_val > 0 else 0.0
+    
     tot_annual_div = sum(r['annual_div_cash'] for r in results)
     tot_div_yield = (tot_annual_div / tot_val * 100.0) if tot_val > 0 else 0.0
     above_30w_count = sum(1 for r in results if r['dist_30w_pct'] >= 0)
 
+    # 頂部 KPI 卡片
     kpi1, kpi2 = st.columns(2)
     kpi1.metric("總持股市值", f"${tot_val:,.2f} HKD", f"總成本: ${tot_cost:,.2f}")
-    kpi2.metric("今日總損益", f"${tot_daily_pl:+,.2f}", f"{tot_daily_pct:+.2f}%")
+    kpi2.metric("全倉總盈虧", f"${tot_overall_pl:+,.2f} HKD", f"{tot_overall_pct:+.2f}%")
 
     kpi3, kpi4 = st.columns(2)
-    kpi3.metric("組合股息率", f"{tot_div_yield:.2f}%", f"年股息現金流: ${tot_annual_div:,.2f}")
-    kpi4.metric("30W均線動能體質", f"{above_30w_count}/{len(results)} 檔線上", "Stage 2 續抱" if above_30w_count == len(results) else "注意破線標的")
+    kpi3.metric("今日總損益", f"${tot_daily_pl:+,.2f}", f"{tot_daily_pct:+.2f}%")
+    kpi4.metric("組合年股息", f"${tot_annual_div:,.2f} /年", f"股息率: {tot_div_yield:.2f}%")
 
     st.markdown("---")
 
@@ -289,22 +314,38 @@ if results:
         "💰 5年股息現金流"
     ])
 
+    # ---------------- TAB 1: 每日即時監控 ----------------
     with tab1:
         daily_rows = []
         for r in results:
             daily_rows.append({
                 "代號": r['symbol'],
-                "名稱": r['name'],
                 "現價": f"${r['current_price']:.2f}",
                 "今日漲跌": f"{r['daily_chg']:+.2f}",
-                "漲跌幅 (%)": f"{r['daily_pct']:+.2f}%",
+                "今日漲跌幅 (%)": f"{r['daily_pct']:+.2f}%",
                 "52W最高價": f"${r['high_52w']:.2f}",
                 "距52W高點": f"{r['dist_52w_pct']:.1f}%",
                 "持股數": f"{int(r['shares']):,}",
-                "市值 (HKD)": f"${r['market_val']:,.2f}"
+                "市值 (HKD)": f"${r['market_val']:,.2f}",
+                "持倉總盈虧 (HKD)": f"{r['holding_pl']:+,.2f}",
+                "持倉盈虧率 (%)": f"{r['holding_pl_pct']:+.2f}%"
             })
+        
+        daily_rows.append({
+            "代號": "📊 TOTAL 總和",
+            "現價": "-",
+            "今日漲跌": f"${tot_daily_pl:+,.2f}",
+            "今日漲跌幅 (%)": f"{tot_daily_pct:+.2f}%",
+            "52W最高價": "-",
+            "距52W高點": "-",
+            "持股數": f"{int(sum(r['shares'] for r in results)):,}",
+            "市值 (HKD)": f"${tot_val:,.2f}",
+            "持倉總盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
+            "持倉盈虧率 (%)": f"{tot_overall_pct:+.2f}%"
+        })
         st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
 
+    # ---------------- TAB 2: 週線與均線動能 ----------------
     with tab2:
         momentum_rows = []
         for r in results:
@@ -318,10 +359,26 @@ if results:
                 "200 EMA %": f"{r['ema200_pct']:+.2f}%",
                 "30W MA": f"${r['ma30w']:.2f}",
                 "距 30W MA %": f"{r['dist_30w_pct']:+.2f}%",
+                "30W 線動能趨勢": r['ma30w_trend'],
                 "趨勢狀態": r['trend_status']
             })
+        
+        momentum_rows.append({
+            "代號": "📊 體質統計",
+            "現價": "-",
+            "10 EMA %": "-",
+            "20 EMA %": "-",
+            "30 EMA %": "-",
+            "50 EMA %": "-",
+            "200 EMA %": "-",
+            "30W MA": "-",
+            "距 30W MA %": f"{above_30w_count}/{len(results)} 檔在線上",
+            "30W 線動能趨勢": "-",
+            "趨勢狀態": "Stage 2 多頭優勢" if above_30w_count == len(results) else "需注意破線標的"
+        })
         st.dataframe(pd.DataFrame(momentum_rows), use_container_width=True, hide_index=True)
 
+    # ---------------- TAB 3: 5年複合成長 (CAGR) ----------------
     with tab3:
         growth_rows = []
         for r in results:
@@ -334,8 +391,21 @@ if results:
                 "5年每股股息總額": f"${r['total_div_5y']:.2f}",
                 "含息總回報 %": f"{r['total_return_5y']:+.2f}%"
             })
+        
+        avg_cagr = sum(r['cagr_5y'] for r in results) / len(results)
+        avg_tot_ret = sum(r['total_return_5y'] for r in results) / len(results)
+        growth_rows.append({
+            "代號": "📊 平均表現",
+            "5年前起算價": "-",
+            "現價": "-",
+            "5年純漲幅": "-",
+            "5年 CAGR": f"{avg_cagr:.2f}% (平均)",
+            "5年每股股息總額": "-",
+            "含息總回報 %": f"{avg_tot_ret:.2f}% (平均)"
+        })
         st.dataframe(pd.DataFrame(growth_rows), use_container_width=True, hide_index=True)
 
+    # ---------------- TAB 4: 5年股息現金流 ----------------
     with tab4:
         div_rows = []
         for r in results:
@@ -348,6 +418,68 @@ if results:
                 "當前股息率 (%)": f"{r['div_yield']:.2f}%",
                 "成本殖利率 (YOC)": f"{r['yoc']:.2f}%"
             })
+        
+        tot_div_5y_cash = sum(r['total_div_5y'] * r['shares'] for r in results)
+        avg_yoc = (tot_annual_div / tot_cost * 100.0) if tot_cost > 0 else 0.0
+        div_rows.append({
+            "代號": "📊 TOTAL 總和",
+            "持股數": f"{int(sum(r['shares'] for r in results)):,}",
+            "5年每股累計股息": "-",
+            "5年實收總股息": f"${tot_div_5y_cash:,.2f}",
+            "預估年息收入": f"${tot_annual_div:,.2f}",
+            "當前股息率 (%)": f"{tot_div_yield:.2f}%",
+            "成本殖利率 (YOC)": f"{avg_yoc:.2f}%"
+        })
         st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
+
+    # ---------------- 7. 最底層 Footnote 指標定義按鈕 ----------------
+    st.markdown("<br><hr style='border: 0.5px solid #2d3748;'>", unsafe_allow_html=True)
+    
+    @st.dialog("📖 指標定義與計算邏輯說明 (Footnote)")
+    def show_footnotes():
+        st.markdown("""
+        ### 1. 均線與週線動能體質 (Momentum & Trend)
+        * **10 / 20 / 30 / 50 / 200 EMA (%)**：
+          指數移動平均線（Exponential Moving Average）距離百分比。
+          $$\\text{EMA \\%} = \\frac{\\text{現價} - \\text{EMA}}{\\text{EMA}} \\times 100\\%$$
+          正數代表股價站在該均線之上，數值愈大短期動能愈強烈。
+        * **30W MA (30週移動平均線)**：
+          Stan Weinstein 階段分析法（Stage Analysis）的核心牛熊分水嶺（以過去 150 個交易日簡單均線計算）。
+        * **30W 線動能趨勢 (走近 / 遠離)**：
+          比較**「今日乖離率」**與**「兩週前 (10 個交易日前) 乖離率」**的絕對差距變化，以 **2.5%** 作為中長線過濾雜訊的基準閾值：
+          * **🚀 擴大遠離 (強勢多頭)**：股價在 30W 線上方，且兩週內加速拋離均線超過 2.5%（主升浪動能增強）。
+          * **🧲 回踩走近 (尋求支撐)**：股價在 30W 線上方，但兩週內向 30W 線回調收窄超過 2.5%（回踩測試均線支撐）。
+          * **⏸️ 貼線平穩運行**：兩週內距離變化在 $\\pm 2.5\\%$ 以內（貼線窄幅橫盤整理）。
+          * **📉 破線下殺 (加速遠離)**：股價跌破 30W 線，且負乖離持續擴大超過 2.5%。
+          * **⤴️ 跌深反彈 (逼近30W)**：股價在 30W 線下方反彈回升，向 30W 線逼近。
+        * **Stage 2 多頭續抱**：現價同時高於 30W MA 與 10 EMA，屬於標準主升多頭型態。
+
+        ---
+
+        ### 2. 5年長期成長指標 (Growth & Returns)
+        * **5年 CAGR (年化複合成長率)**：
+          衡量過去 5 年純股價的年均幾何增長速度（不含股息）：
+          $$\\text{CAGR} = \\left( \\frac{\\text{現價}}{\\text{5年前股價}} \\right)^{\\frac{1}{5}} - 1$$
+        * **5年含息總回報率 (%)**：
+          將過去 5 年累計派發的所有現金股利加回目前股價，計算真實的整體投資回報：
+          $$\\text{含息總回報} = \\frac{\\text{現價} - \\text{5年前股價} + \\text{5年每股股息總額}}{\\text{5年前股價}} \\times 100\\%$$
+
+        ---
+
+        ### 3. 現金流與股利收益率 (Dividends & Cashflow)
+        * **5年實收總股息**：該股票過去 5 年派發的每股現金股息總和 $\\times$ 當前持股數量。
+        * **預估年息收入**：依據近 1 年（365天內）該股票的官方派息總額 $\\times$ 持股數推算。
+        * **當前股息率 (%)**：以當前市場現價計算的前瞻現金流收益率：
+          $$\\text{當前股息率} = \\frac{\\text{近一年每股派息}}{\\text{現價}} \\times 100\\%$$
+        * **成本殖利率 (Yield on Cost, YOC)**：
+          以你的**買入成本價**為基準計算的真實分紅收益率：
+          $$\\text{YOC} = \\frac{\\text{近一年每股派息}}{\\text{買入成本均價}} \\times 100\\%$$
+        """)
+
+    foot_col1, foot_col2, foot_col3 = st.columns([1, 2, 1])
+    with foot_col2:
+        if st.button("📖 查看指標定義與計算說明 (Footnote)", use_container_width=True):
+            show_footnotes()
+
 else:
     st.info("目前 Google Sheet 資料庫內無持股。請展開上方「買入 / 沽出持股管理」輸入您的第一檔港股。")
