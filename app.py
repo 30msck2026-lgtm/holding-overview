@@ -116,7 +116,7 @@ def fetch_stock_analytics(sym, shares, cost):
         ma30w = float(ma30w_window.mean())
         dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0 if ma30w > 0 else 0.0
 
-        # --- 30W MA 動態走近/遠離 Indicator (設定 2.5% 中長線合理閾值) ---
+        # 30W MA 趨勢指標 (以 2.5% 為中長線合理閾值)
         past_closes = closes.iloc[:-10]
         past_ma30w = float(past_closes.tail(150).mean())
         past_price = float(past_closes.iloc[-1])
@@ -137,7 +137,7 @@ def fetch_stock_analytics(sym, shares, cost):
             else:
                 ma30w_trend = "⤴️ 跌深反彈 (逼近30W)"
 
-        # 總體趨勢狀態
+        # 趨勢型態
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
         elif curr_price >= ma30w and curr_price < ema10:
@@ -227,7 +227,7 @@ with col_btn:
         st.session_state.holdings = load_holdings_from_gsheet()
         st.rerun()
 
-# 5. 買入 / 沽出管理區
+# 5. 買入 / 沽出管理區 (買入成本價支援小數後三位)
 with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
     top_col_left, top_col_right = st.columns(2)
     
@@ -236,7 +236,7 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
         with st.form("buy_form"):
             in_sym = st.text_input("港股代號 (例: 0700, 0005, 0941)").strip()
             in_shares = st.number_input("持有股數", min_value=1.0, step=100.0, value=500.0)
-            in_cost = st.number_input("買入成本均價 (HKD，可選填)", min_value=0.0, step=1.0, value=0.0)
+            in_cost = st.number_input("買入成本均價 (HKD，可填至小數後三位)", min_value=0.0, step=0.001, format="%.3f", value=0.0)
             btn_buy = st.form_submit_button("確認新增並存入雲端", use_container_width=True)
             
             if btn_buy and in_sym:
@@ -314,33 +314,36 @@ if results:
         "💰 5年股息現金流"
     ])
 
-    # ---------------- TAB 1: 每日即時監控 ----------------
+    # ---------------- TAB 1: 每日即時監控 (已加入買入成本價與各別盈虧，底部只統計全倉) ----------------
     with tab1:
         daily_rows = []
         for r in results:
             daily_rows.append({
                 "代號": r['symbol'],
                 "現價": f"${r['current_price']:.2f}",
+                "買入成本價": f"${r['cost']:.3f}",
                 "今日漲跌": f"{r['daily_chg']:+.2f}",
                 "今日漲跌幅 (%)": f"{r['daily_pct']:+.2f}%",
                 "52W最高價": f"${r['high_52w']:.2f}",
                 "距52W高點": f"{r['dist_52w_pct']:.1f}%",
                 "持股數": f"{int(r['shares']):,}",
                 "市值 (HKD)": f"${r['market_val']:,.2f}",
-                "持倉總盈虧 (HKD)": f"{r['holding_pl']:+,.2f}",
+                "持倉盈虧 (HKD)": f"{r['holding_pl']:+,.2f}",
                 "持倉盈虧率 (%)": f"{r['holding_pl_pct']:+.2f}%"
             })
         
+        # 底部總和列：專注全倉實質總和
         daily_rows.append({
             "代號": "📊 TOTAL 總和",
             "現價": "-",
+            "買入成本價": "-",
             "今日漲跌": f"${tot_daily_pl:+,.2f}",
-            "今日漲跌幅 (%)": f"{tot_daily_pct:+.2f}%",
+            "今日漲跌幅 (%)": "-",
             "52W最高價": "-",
             "距52W高點": "-",
             "持股數": f"{int(sum(r['shares'] for r in results)):,}",
             "市值 (HKD)": f"${tot_val:,.2f}",
-            "持倉總盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
+            "持倉盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
             "持倉盈虧率 (%)": f"{tot_overall_pct:+.2f}%"
         })
         st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
@@ -378,7 +381,7 @@ if results:
         })
         st.dataframe(pd.DataFrame(momentum_rows), use_container_width=True, hide_index=True)
 
-    # ---------------- TAB 3: 5年複合成長 (CAGR) ----------------
+    # ---------------- TAB 3: 5年複合成長 (CAGR) (已徹底移除平均列) ----------------
     with tab3:
         growth_rows = []
         for r in results:
@@ -391,21 +394,9 @@ if results:
                 "5年每股股息總額": f"${r['total_div_5y']:.2f}",
                 "含息總回報 %": f"{r['total_return_5y']:+.2f}%"
             })
-        
-        avg_cagr = sum(r['cagr_5y'] for r in results) / len(results)
-        avg_tot_ret = sum(r['total_return_5y'] for r in results) / len(results)
-        growth_rows.append({
-            "代號": "📊 平均表現",
-            "5年前起算價": "-",
-            "現價": "-",
-            "5年純漲幅": "-",
-            "5年 CAGR": f"{avg_cagr:.2f}% (平均)",
-            "5年每股股息總額": "-",
-            "含息總回報 %": f"{avg_tot_ret:.2f}% (平均)"
-        })
         st.dataframe(pd.DataFrame(growth_rows), use_container_width=True, hide_index=True)
 
-    # ---------------- TAB 4: 5年股息現金流 ----------------
+    # ---------------- TAB 4: 5年股息現金流 (只匯總股息實收總和) ----------------
     with tab4:
         div_rows = []
         for r in results:
@@ -420,15 +411,16 @@ if results:
             })
         
         tot_div_5y_cash = sum(r['total_div_5y'] * r['shares'] for r in results)
-        avg_yoc = (tot_annual_div / tot_cost * 100.0) if tot_cost > 0 else 0.0
+        tot_yoc_overall = (tot_annual_div / tot_cost * 100.0) if tot_cost > 0 else 0.0
+        
         div_rows.append({
             "代號": "📊 TOTAL 總和",
-            "持股數": f"{int(sum(r['shares'] for r in results)):,}",
+            "持股數": "-",
             "5年每股累計股息": "-",
             "5年實收總股息": f"${tot_div_5y_cash:,.2f}",
             "預估年息收入": f"${tot_annual_div:,.2f}",
             "當前股息率 (%)": f"{tot_div_yield:.2f}%",
-            "成本殖利率 (YOC)": f"{avg_yoc:.2f}%"
+            "成本殖利率 (YOC)": f"{tot_yoc_overall:.2f}%"
         })
         st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
 
@@ -470,10 +462,10 @@ if results:
         * **5年實收總股息**：該股票過去 5 年派發的每股現金股息總和 $\\times$ 當前持股數量。
         * **預估年息收入**：依據近 1 年（365天內）該股票的官方派息總額 $\\times$ 持股數推算。
         * **當前股息率 (%)**：以當前市場現價計算的前瞻現金流收益率：
-          $$\\text{當前股息率} = \\frac{\\text{近一年每股派息}}{\\text{現價}} \\times 100\\%$$
+          $$\\text{當前股息率} = \\frac{\\text{全倉預估年股息總和}}{\\text{全倉總市值}} \\times 100\\%$$
         * **成本殖利率 (Yield on Cost, YOC)**：
           以你的**買入成本價**為基準計算的真實分紅收益率：
-          $$\\text{YOC} = \\frac{\\text{近一年每股派息}}{\\text{買入成本均價}} \\times 100\\%$$
+          $$\\text{YOC} = \\frac{\\text{全倉預估年股息總和}}{\\text{全倉總成本}} \\times 100\\%$$
         """)
 
     foot_col1, foot_col2, foot_col3 = st.columns([1, 2, 1])
