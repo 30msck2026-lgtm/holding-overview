@@ -227,7 +227,7 @@ with col_btn:
         st.session_state.holdings = load_holdings_from_gsheet()
         st.rerun()
 
-# 5. 買入 / 沽出管理區 (買入成本價支援小數後三位)
+# 5. 買入 / 沽出管理區
 with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(len(st.session_state.holdings) == 0)):
     top_col_left, top_col_right = st.columns(2)
     
@@ -314,7 +314,7 @@ if results:
         "💰 5年股息現金流"
     ])
 
-    # ---------------- TAB 1: 每日即時監控 (已加入買入成本價與各別盈虧，底部只統計全倉) ----------------
+    # ---------------- TAB 1: 每日即時監控 ----------------
     with tab1:
         daily_rows = []
         for r in results:
@@ -332,16 +332,16 @@ if results:
                 "持倉盈虧率 (%)": f"{r['holding_pl_pct']:+.2f}%"
             })
         
-        # 底部總和列：專注全倉實質總和
+        # 底部總和列：持股數與今日漲跌改為 '-'，專注於全倉市值與實質盈虧
         daily_rows.append({
             "代號": "📊 TOTAL 總和",
             "現價": "-",
             "買入成本價": "-",
-            "今日漲跌": f"${tot_daily_pl:+,.2f}",
+            "今日漲跌": "-",
             "今日漲跌幅 (%)": "-",
             "52W最高價": "-",
             "距52W高點": "-",
-            "持股數": f"{int(sum(r['shares'] for r in results)):,}",
+            "持股數": "-",
             "市值 (HKD)": f"${tot_val:,.2f}",
             "持倉盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
             "持倉盈虧率 (%)": f"{tot_overall_pct:+.2f}%"
@@ -381,7 +381,7 @@ if results:
         })
         st.dataframe(pd.DataFrame(momentum_rows), use_container_width=True, hide_index=True)
 
-    # ---------------- TAB 3: 5年複合成長 (CAGR) (已徹底移除平均列) ----------------
+    # ---------------- TAB 3: 5年複合成長 (CAGR) (無平均總和列) ----------------
     with tab3:
         growth_rows = []
         for r in results:
