@@ -16,7 +16,8 @@ st.set_page_config(
 
 # 注入自訂 CSS：
 # 1. 縮小頂部 KPI 數字與間距
-# 2. 打造手機專屬自適應表格：鎖定第一欄代號 (Sticky Column)，並消除內部上下滾動衝突
+# 2. 緊湊型金融表格：精簡第一欄寬度（約 62px），各欄位緊湊不浪費空間
+# 3. 完整的 30W 破線警示條，不再被截斷
 st.markdown("""
 <style>
 /* 縮小 st.metric 數值字體 */
@@ -32,10 +33,29 @@ st.markdown("""
     font-size: 0.8rem !important;
 }
 div[data-testid="metric-container"] {
-    padding: 6px 10px !important;
+    padding: 6px 8px !important;
 }
 
-/* 自訂專業金融表格容器 (只允許橫向滑動，高度完全展開，解決雙重上下滾動衝突) */
+/* 30W MA 專屬動能與完整警示條樣式 (自動換行，杜絕省略截斷) */
+.ma30w-alert-box {
+    background-color: #1c1917;
+    border: 1px solid #78350f;
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-top: 4px;
+    margin-bottom: 12px;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: #fef08a;
+    word-break: break-word;
+}
+.ma30w-alert-box.green {
+    background-color: #064e3b;
+    border-color: #047857;
+    color: #a7f3d0;
+}
+
+/* 自訂專業金融表格容器 (只允許橫向滑動，高度完全展開，解決上下滾動衝突) */
 .table-responsive-container {
     width: 100%;
     overflow-x: auto;
@@ -46,16 +66,17 @@ div[data-testid="metric-container"] {
 }
 
 .custom-stock-table {
-    width: 100%;
+    width: max-content;
+    min-width: 100%;
     border-collapse: separate;
     border-spacing: 0;
-    font-size: 0.85rem;
+    font-size: 0.82rem;
     color: #e2e8f0;
     background-color: #0e1117;
 }
 
 .custom-stock-table th, .custom-stock-table td {
-    padding: 10px 12px;
+    padding: 8px 8px;
     white-space: nowrap;
     border-bottom: 1px solid #1a202c;
     text-align: right;
@@ -67,16 +88,20 @@ div[data-testid="metric-container"] {
     font-weight: 600;
 }
 
-/* 核心：鎖定左側第一欄代號 (Sticky Freeze) */
+/* 核心優化：鎖定左側第一欄「代號」，並將寬度大幅收窄至剛好容納 4 碼代號 */
 .custom-stock-table th:first-child,
 .custom-stock-table td:first-child {
     position: sticky;
     left: 0;
     z-index: 2;
-    text-align: left;
+    text-align: center;
+    width: 62px !important;
+    min-width: 62px !important;
+    max-width: 65px !important;
     background-color: #161b22 !important;
     border-right: 2px solid #2d3748;
     font-weight: bold;
+    padding: 8px 4px !important;
 }
 
 .custom-stock-table th:first-child {
@@ -206,17 +231,17 @@ def fetch_stock_analytics(sym, shares, cost):
         gap_diff = abs(dist_30w_pct) - abs(past_dist_30w_pct)
         
         if abs(gap_diff) <= 2.5:
-            ma30w_trend = "⏸️ 貼線平穩運行"
+            ma30w_trend = "⏸️ 貼線平穩"
         elif curr_price >= ma30w:
             if gap_diff > 2.5:
-                ma30w_trend = "🚀 擴大遠離 (強勢多頭)"
+                ma30w_trend = "🚀 擴大遠離"
             else:
-                ma30w_trend = "🧲 回踩走近 (尋求支撐)"
+                ma30w_trend = "🧲 回踩走近"
         else:
             if gap_diff > 2.5:
-                ma30w_trend = "📉 破線下殺 (加速遠離)"
+                ma30w_trend = "📉 破線下殺"
             else:
-                ma30w_trend = "⤴️ 跌深反彈 (逼近30W)"
+                ma30w_trend = "⤴️ 跌深反彈"
 
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
@@ -353,17 +378,15 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
         else:
             st.info("目前 Google Sheet 內無持股。")
 
-# 輔助函數：將列表轉為自訂凍結首欄、無內部滾動的響應式 HTML 表格
+# 輔助函數：渲染緊湊型 Sticky 表格（第一欄僅 62px 寬，節省空間）
 def render_sticky_table(data_rows, columns):
     html = ['<div class="table-responsive-container"><table class="custom-stock-table">']
     
-    # 標題列
     html.append("<thead><tr>")
     for col in columns:
         html.append(f"<th>{col}</th>")
     html.append("</tr></thead><tbody>")
     
-    # 數據列
     for row in data_rows:
         is_total = "TOTAL" in str(row.get("代號", ""))
         tr_class = ' class="total-row"' if is_total else ''
@@ -400,17 +423,12 @@ if results:
     
     total_count = len(results)
 
-    # 30 週線 (30W MA) 統計與警示計算
+    # 30 週線 (30W MA) 統計清單
     above_30w_list = [r['symbol'] for r in results if r['dist_30w_pct'] >= 0]
     below_30w_list = [r['symbol'] for r in results if r['dist_30w_pct'] < 0]
     above_30w_count = len(above_30w_list)
 
-    if above_30w_count == total_count:
-        ma30w_alert = "🟢 全數處於 30週牛市線上"
-    else:
-        ma30w_alert = f"⚠️ 跌破30週線: {', '.join(below_30w_list)}"
-
-    # 頂部 KPI 卡片 (字體緊湊)
+    # 頂部 KPI 卡片
     kpi1, kpi2 = st.columns(2)
     kpi1.metric("總持股市值", f"${tot_val:,.2f} HKD", f"總成本: ${tot_cost:,.2f}")
     kpi2.metric("全倉總盈虧", f"${tot_overall_pl:+,.2f} HKD", f"{tot_overall_pct:+.2f}%")
@@ -419,8 +437,12 @@ if results:
     kpi3.metric("今日總損益", f"${tot_daily_pl:+,.2f}", f"{tot_daily_pct:+.2f}%")
     kpi4.metric("組合年股息", f"${tot_annual_div:,.2f} /年", f"股息率: {tot_div_yield:.2f}%")
 
-    kpi5, _ = st.columns([1, 1])
-    kpi5.metric("30週線 (30W MA) 動能", f"{above_30w_count} / {total_count} 檔線上", ma30w_alert)
+    # 30 週線動能卡片與「完整不截斷」的提示條
+    st.metric("30週線 (30W MA) 動能", f"{above_30w_count} / {total_count} 檔線上")
+    if above_30w_count == total_count:
+        st.markdown('<div class="ma30w-alert-box green">🟢 <b>多頭健康：</b>目前全部持股皆處於 30 週牛市線上！</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="ma30w-alert-box">⚠️ <b>跌破30週線清單 ({len(below_30w_list)}檔)：</b><br>{", ".join(below_30w_list)}</div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -431,130 +453,130 @@ if results:
         "💰 5年股息現金流"
     ])
 
-    # ---------------- TAB 1: 每日即時監控 (鎖定第一欄代號，高度自適應) ----------------
+    # ---------------- TAB 1: 每日即時監控 ----------------
     with tab1:
         daily_cols = [
-            "代號", "現價", "買入成本價", "今日漲跌", "今日漲跌幅 (%)",
-            "52W最高價", "距52W高點", "持股數", "市值 (HKD)",
-            "持倉盈虧 (HKD)", "持倉盈虧率 (%)"
+            "代號", "現價", "買入成本", "今日漲跌", "漲跌幅",
+            "52W最高", "距52W", "持股數", "市值",
+            "持倉盈虧", "盈虧率"
         ]
         daily_rows = []
         for r in results:
             daily_rows.append({
                 "代號": r['symbol'],
                 "現價": f"${r['current_price']:.2f}",
-                "買入成本價": f"${r['cost']:.3f}",
+                "買入成本": f"${r['cost']:.3f}",
                 "今日漲跌": f"{r['daily_chg']:+.2f}",
-                "今日漲跌幅 (%)": f"{r['daily_pct']:+.2f}%",
-                "52W最高價": f"${r['high_52w']:.2f}",
-                "距52W高點": f"{r['dist_52w_pct']:.1f}%",
+                "漲跌幅": f"{r['daily_pct']:+.2f}%",
+                "52W最高": f"${r['high_52w']:.2f}",
+                "距52W": f"{r['dist_52w_pct']:.1f}%",
                 "持股數": f"{int(r['shares']):,}",
-                "市值 (HKD)": f"${r['market_val']:,.2f}",
-                "持倉盈虧 (HKD)": f"{r['holding_pl']:+,.2f}",
-                "持倉盈虧率 (%)": f"{r['holding_pl_pct']:+.2f}%"
+                "市值": f"${r['market_val']:,.2f}",
+                "持倉盈虧": f"{r['holding_pl']:+,.2f}",
+                "盈虧率": f"{r['holding_pl_pct']:+.2f}%"
             })
         
         daily_rows.append({
-            "代號": "📊 TOTAL 總和",
+            "代號": "📊 TOTAL",
             "現價": "-",
-            "買入成本價": "-",
+            "買入成本": "-",
             "今日漲跌": "-",
-            "今日漲跌幅 (%)": "-",
-            "52W最高價": "-",
-            "距52W高點": "-",
+            "漲跌幅": "-",
+            "52W最高": "-",
+            "距52W": "-",
             "持股數": "-",
-            "市值 (HKD)": f"${tot_val:,.2f}",
-            "持倉盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
-            "持倉盈虧率 (%)": f"{tot_overall_pct:+.2f}%"
+            "市值": f"${tot_val:,.2f}",
+            "持倉盈虧": f"${tot_overall_pl:+,.2f}",
+            "盈虧率": f"{tot_overall_pct:+.2f}%"
         })
         render_sticky_table(daily_rows, daily_cols)
 
     # ---------------- TAB 2: 週線與均線動能 ----------------
     with tab2:
         momentum_cols = [
-            "代號", "現價", "10 EMA %", "20 EMA %", "30 EMA %",
-            "50 EMA %", "200 EMA %", "30W MA", "距 30W MA %",
-            "30W 線動能趨勢", "趨勢狀態"
+            "代號", "現價", "10 EMA", "20 EMA", "30 EMA",
+            "50 EMA", "200 EMA", "30W MA", "距 30W %",
+            "動能趨勢", "趨勢狀態"
         ]
         momentum_rows = []
         for r in results:
             momentum_rows.append({
                 "代號": r['symbol'],
                 "現價": f"${r['current_price']:.2f}",
-                "10 EMA %": f"{r['ema10_pct']:+.2f}%",
-                "20 EMA %": f"{r['ema20_pct']:+.2f}%",
-                "30 EMA %": f"{r['ema30_pct']:+.2f}%",
-                "50 EMA %": f"{r['ema50_pct']:+.2f}%",
-                "200 EMA %": f"{r['ema200_pct']:+.2f}%",
+                "10 EMA": f"{r['ema10_pct']:+.2f}%",
+                "20 EMA": f"{r['ema20_pct']:+.2f}%",
+                "30 EMA": f"{r['ema30_pct']:+.2f}%",
+                "50 EMA": f"{r['ema50_pct']:+.2f}%",
+                "200 EMA": f"{r['ema200_pct']:+.2f}%",
                 "30W MA": f"${r['ma30w']:.2f}",
-                "距 30W MA %": f"{r['dist_30w_pct']:+.2f}%",
-                "30W 線動能趨勢": r['ma30w_trend'],
+                "距 30W %": f"{r['dist_30w_pct']:+.2f}%",
+                "動能趨勢": r['ma30w_trend'],
                 "趨勢狀態": r['trend_status']
             })
         
         momentum_rows.append({
-            "代號": "📊 體質統計",
+            "代號": "📊 統計",
             "現價": "-",
-            "10 EMA %": "-",
-            "20 EMA %": "-",
-            "30 EMA %": "-",
-            "50 EMA %": "-",
-            "200 EMA %": "-",
+            "10 EMA": "-",
+            "20 EMA": "-",
+            "30 EMA": "-",
+            "50 EMA": "-",
+            "200 EMA": "-",
             "30W MA": "-",
-            "距 30W MA %": f"{above_30w_count} / {total_count} 檔在線上",
-            "30W 線動能趨勢": "-",
-            "趨勢狀態": "Stage 2 多頭優勢" if above_30w_count == total_count else "需注意破線標的"
+            "距 30W %": f"{above_30w_count}/{total_count} 線上",
+            "動能趨勢": "-",
+            "趨勢狀態": "Stage 2 多頭" if above_30w_count == total_count else "注意破線標的"
         })
         render_sticky_table(momentum_rows, momentum_cols)
 
     # ---------------- TAB 3: 5年複合成長 (CAGR) ----------------
     with tab3:
         growth_cols = [
-            "代號", "5年前起算價", "現價", "5年純漲幅",
-            "5年 CAGR", "5年每股股息總額", "含息總回報 %"
+            "代號", "5年前價", "現價", "5年純漲幅",
+            "5年 CAGR", "5年總股息", "含息總回報"
         ]
         growth_rows = []
         for r in results:
             growth_rows.append({
                 "代號": r['symbol'],
-                "5年前起算價": f"${r['price_5y_ago']:.2f}",
+                "5年前價": f"${r['price_5y_ago']:.2f}",
                 "現價": f"${r['current_price']:.2f}",
                 "5年純漲幅": f"{r['price_growth_5y']:+.2f}%",
                 "5年 CAGR": f"{r['cagr_5y']:.2f}%",
-                "5年每股股息總額": f"${r['total_div_5y']:.2f}",
-                "含息總回報 %": f"{r['total_return_5y']:+.2f}%"
+                "5年總股息": f"${r['total_div_5y']:.2f}",
+                "含息總回報": f"{r['total_return_5y']:+.2f}%"
             })
         render_sticky_table(growth_rows, growth_cols)
 
     # ---------------- TAB 4: 5年股息現金流 ----------------
     with tab4:
         div_cols = [
-            "代號", "持股數", "5年每股累計股息", "5年實收總股息",
-            "預估年息收入", "當前股息率 (%)", "成本殖利率 (YOC) %"
+            "代號", "持股數", "5年每股息", "5年實收息",
+            "預估年息", "股息率", "成本殖利率 (YOC)"
         ]
         div_rows = []
         for r in results:
             div_rows.append({
                 "代號": r['symbol'],
                 "持股數": f"{int(r['shares']):,}",
-                "5年每股累計股息": f"${r['total_div_5y']:.2f}",
-                "5年實收總股息": f"${(r['total_div_5y'] * r['shares']):,.2f}",
-                "預估年息收入": f"${r['annual_div_cash']:,.2f}",
-                "當前股息率 (%)": f"{r['div_yield']:.2f}%",
-                "成本殖利率 (YOC) %": f"{r['yoc']:.2f}%"
+                "5年每股息": f"${r['total_div_5y']:.2f}",
+                "5年實收息": f"${(r['total_div_5y'] * r['shares']):,.2f}",
+                "預估年息": f"${r['annual_div_cash']:,.2f}",
+                "股息率": f"{r['div_yield']:.2f}%",
+                "成本殖利率 (YOC)": f"{r['yoc']:.2f}%"
             })
         
         tot_div_5y_cash = sum(r['total_div_5y'] * r['shares'] for r in results)
         tot_yoc_overall = (tot_annual_div / tot_cost * 100.0) if tot_cost > 0 else 0.0
         
         div_rows.append({
-            "代號": "📊 TOTAL 總和",
+            "代號": "📊 TOTAL",
             "持股數": "-",
-            "5年每股累計股息": "-",
-            "5年實收總股息": f"${tot_div_5y_cash:,.2f}",
-            "預估年息收入": f"${tot_annual_div:,.2f}",
-            "當前股息率 (%)": f"{tot_div_yield:.2f}%",
-            "成本殖利率 (YOC) %": f"{tot_yoc_overall:.2f}%"
+            "5年每股息": "-",
+            "5年實收息": f"${tot_div_5y_cash:,.2f}",
+            "預估年息": f"${tot_annual_div:,.2f}",
+            "股息率": f"{tot_div_yield:.2f}%",
+            "成本殖利率 (YOC)": f"{tot_yoc_overall:.2f}%"
         })
         render_sticky_table(div_rows, div_cols)
 
