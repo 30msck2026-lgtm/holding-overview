@@ -14,6 +14,90 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# 注入自訂 CSS：
+# 1. 縮小頂部 KPI 數字與間距
+# 2. 打造手機專屬自適應表格：鎖定第一欄代號 (Sticky Column)，並消除內部上下滾動衝突
+st.markdown("""
+<style>
+/* 縮小 st.metric 數值字體 */
+[data-testid="stMetricValue"] {
+    font-size: 1.35rem !important;
+    font-weight: 600 !important;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 0.85rem !important;
+    color: #a0aec0 !important;
+}
+[data-testid="stMetricDelta"] {
+    font-size: 0.8rem !important;
+}
+div[data-testid="metric-container"] {
+    padding: 6px 10px !important;
+}
+
+/* 自訂專業金融表格容器 (只允許橫向滑動，高度完全展開，解決雙重上下滾動衝突) */
+.table-responsive-container {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin-bottom: 1.5rem;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+}
+
+.custom-stock-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.85rem;
+    color: #e2e8f0;
+    background-color: #0e1117;
+}
+
+.custom-stock-table th, .custom-stock-table td {
+    padding: 10px 12px;
+    white-space: nowrap;
+    border-bottom: 1px solid #1a202c;
+    text-align: right;
+}
+
+.custom-stock-table th {
+    background-color: #1a202c;
+    color: #a0aec0;
+    font-weight: 600;
+}
+
+/* 核心：鎖定左側第一欄代號 (Sticky Freeze) */
+.custom-stock-table th:first-child,
+.custom-stock-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    text-align: left;
+    background-color: #161b22 !important;
+    border-right: 2px solid #2d3748;
+    font-weight: bold;
+}
+
+.custom-stock-table th:first-child {
+    z-index: 3;
+    background-color: #21262d !important;
+}
+
+/* 總和列 (TOTAL) 強調樣式 */
+.custom-stock-table tr.total-row td {
+    font-weight: bold;
+    background-color: #1a202c !important;
+    border-top: 2px solid #4a5568;
+    color: #edf2f7;
+}
+
+.custom-stock-table tr.total-row td:first-child {
+    background-color: #21262d !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # 2. Google Sheets 核心讀寫模組
 def get_sheet_id():
     url = st.secrets.get("SHEET_URL", "")
@@ -104,19 +188,16 @@ def fetch_stock_analytics(sym, shares, cost):
         high_52w = float(last_250.max())
         dist_52w_pct = ((curr_price - high_52w) / high_52w) * 100.0 if high_52w > 0 else 0.0
 
-        # 正確順序的 EMA 均線矩陣
         ema10 = float(closes.ewm(span=10, adjust=False).mean().iloc[-1])
         ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
         ema30 = float(closes.ewm(span=30, adjust=False).mean().iloc[-1])
         ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
         ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
 
-        # 30 週線 (150日) 即時數值
         ma30w_window = closes.tail(150)
         ma30w = float(ma30w_window.mean())
         dist_30w_pct = ((curr_price - ma30w) / ma30w) * 100.0 if ma30w > 0 else 0.0
 
-        # 30W MA 趨勢指標 (以 2.5% 為中長線合理閾值)
         past_closes = closes.iloc[:-10]
         past_ma30w = float(past_closes.tail(150).mean())
         past_price = float(past_closes.iloc[-1])
@@ -137,7 +218,6 @@ def fetch_stock_analytics(sym, shares, cost):
             else:
                 ma30w_trend = "⤴️ 跌深反彈 (逼近30W)"
 
-        # 趨勢型態
         if curr_price >= ma30w and curr_price >= ema10:
             trend_status = "🟢 Stage 2 多頭續抱"
         elif curr_price >= ma30w and curr_price < ema10:
@@ -273,6 +353,29 @@ with st.expander("⚙️ 買入 / 沽出持股管理 (點擊展開)", expanded=(
         else:
             st.info("目前 Google Sheet 內無持股。")
 
+# 輔助函數：將列表轉為自訂凍結首欄、無內部滾動的響應式 HTML 表格
+def render_sticky_table(data_rows, columns):
+    html = ['<div class="table-responsive-container"><table class="custom-stock-table">']
+    
+    # 標題列
+    html.append("<thead><tr>")
+    for col in columns:
+        html.append(f"<th>{col}</th>")
+    html.append("</tr></thead><tbody>")
+    
+    # 數據列
+    for row in data_rows:
+        is_total = "TOTAL" in str(row.get("代號", ""))
+        tr_class = ' class="total-row"' if is_total else ''
+        html.append(f"<tr{tr_class}>")
+        for col in columns:
+            val = str(row.get(col, "-"))
+            html.append(f"<td>{val}</td>")
+        html.append("</tr>")
+        
+    html.append("</tbody></table></div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
 # 6. 計算與展示數據
 results = []
 if st.session_state.holdings:
@@ -294,9 +397,20 @@ if results:
     
     tot_annual_div = sum(r['annual_div_cash'] for r in results)
     tot_div_yield = (tot_annual_div / tot_val * 100.0) if tot_val > 0 else 0.0
-    above_30w_count = sum(1 for r in results if r['dist_30w_pct'] >= 0)
+    
+    total_count = len(results)
 
-    # 頂部 KPI 卡片
+    # 30 週線 (30W MA) 統計與警示計算
+    above_30w_list = [r['symbol'] for r in results if r['dist_30w_pct'] >= 0]
+    below_30w_list = [r['symbol'] for r in results if r['dist_30w_pct'] < 0]
+    above_30w_count = len(above_30w_list)
+
+    if above_30w_count == total_count:
+        ma30w_alert = "🟢 全數處於 30週牛市線上"
+    else:
+        ma30w_alert = f"⚠️ 跌破30週線: {', '.join(below_30w_list)}"
+
+    # 頂部 KPI 卡片 (字體緊湊)
     kpi1, kpi2 = st.columns(2)
     kpi1.metric("總持股市值", f"${tot_val:,.2f} HKD", f"總成本: ${tot_cost:,.2f}")
     kpi2.metric("全倉總盈虧", f"${tot_overall_pl:+,.2f} HKD", f"{tot_overall_pct:+.2f}%")
@@ -304,6 +418,9 @@ if results:
     kpi3, kpi4 = st.columns(2)
     kpi3.metric("今日總損益", f"${tot_daily_pl:+,.2f}", f"{tot_daily_pct:+.2f}%")
     kpi4.metric("組合年股息", f"${tot_annual_div:,.2f} /年", f"股息率: {tot_div_yield:.2f}%")
+
+    kpi5, _ = st.columns([1, 1])
+    kpi5.metric("30週線 (30W MA) 動能", f"{above_30w_count} / {total_count} 檔線上", ma30w_alert)
 
     st.markdown("---")
 
@@ -314,8 +431,13 @@ if results:
         "💰 5年股息現金流"
     ])
 
-    # ---------------- TAB 1: 每日即時監控 ----------------
+    # ---------------- TAB 1: 每日即時監控 (鎖定第一欄代號，高度自適應) ----------------
     with tab1:
+        daily_cols = [
+            "代號", "現價", "買入成本價", "今日漲跌", "今日漲跌幅 (%)",
+            "52W最高價", "距52W高點", "持股數", "市值 (HKD)",
+            "持倉盈虧 (HKD)", "持倉盈虧率 (%)"
+        ]
         daily_rows = []
         for r in results:
             daily_rows.append({
@@ -332,7 +454,6 @@ if results:
                 "持倉盈虧率 (%)": f"{r['holding_pl_pct']:+.2f}%"
             })
         
-        # 底部總和列：持股數與今日漲跌改為 '-'，專注於全倉市值與實質盈虧
         daily_rows.append({
             "代號": "📊 TOTAL 總和",
             "現價": "-",
@@ -346,10 +467,15 @@ if results:
             "持倉盈虧 (HKD)": f"${tot_overall_pl:+,.2f}",
             "持倉盈虧率 (%)": f"{tot_overall_pct:+.2f}%"
         })
-        st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
+        render_sticky_table(daily_rows, daily_cols)
 
     # ---------------- TAB 2: 週線與均線動能 ----------------
     with tab2:
+        momentum_cols = [
+            "代號", "現價", "10 EMA %", "20 EMA %", "30 EMA %",
+            "50 EMA %", "200 EMA %", "30W MA", "距 30W MA %",
+            "30W 線動能趨勢", "趨勢狀態"
+        ]
         momentum_rows = []
         for r in results:
             momentum_rows.append({
@@ -375,14 +501,18 @@ if results:
             "50 EMA %": "-",
             "200 EMA %": "-",
             "30W MA": "-",
-            "距 30W MA %": f"{above_30w_count}/{len(results)} 檔在線上",
+            "距 30W MA %": f"{above_30w_count} / {total_count} 檔在線上",
             "30W 線動能趨勢": "-",
-            "趨勢狀態": "Stage 2 多頭優勢" if above_30w_count == len(results) else "需注意破線標的"
+            "趨勢狀態": "Stage 2 多頭優勢" if above_30w_count == total_count else "需注意破線標的"
         })
-        st.dataframe(pd.DataFrame(momentum_rows), use_container_width=True, hide_index=True)
+        render_sticky_table(momentum_rows, momentum_cols)
 
-    # ---------------- TAB 3: 5年複合成長 (CAGR) (無平均總和列) ----------------
+    # ---------------- TAB 3: 5年複合成長 (CAGR) ----------------
     with tab3:
+        growth_cols = [
+            "代號", "5年前起算價", "現價", "5年純漲幅",
+            "5年 CAGR", "5年每股股息總額", "含息總回報 %"
+        ]
         growth_rows = []
         for r in results:
             growth_rows.append({
@@ -394,10 +524,14 @@ if results:
                 "5年每股股息總額": f"${r['total_div_5y']:.2f}",
                 "含息總回報 %": f"{r['total_return_5y']:+.2f}%"
             })
-        st.dataframe(pd.DataFrame(growth_rows), use_container_width=True, hide_index=True)
+        render_sticky_table(growth_rows, growth_cols)
 
-    # ---------------- TAB 4: 5年股息現金流 (只匯總股息實收總和) ----------------
+    # ---------------- TAB 4: 5年股息現金流 ----------------
     with tab4:
+        div_cols = [
+            "代號", "持股數", "5年每股累計股息", "5年實收總股息",
+            "預估年息收入", "當前股息率 (%)", "成本殖利率 (YOC) %"
+        ]
         div_rows = []
         for r in results:
             div_rows.append({
@@ -407,7 +541,7 @@ if results:
                 "5年實收總股息": f"${(r['total_div_5y'] * r['shares']):,.2f}",
                 "預估年息收入": f"${r['annual_div_cash']:,.2f}",
                 "當前股息率 (%)": f"{r['div_yield']:.2f}%",
-                "成本殖利率 (YOC)": f"{r['yoc']:.2f}%"
+                "成本殖利率 (YOC) %": f"{r['yoc']:.2f}%"
             })
         
         tot_div_5y_cash = sum(r['total_div_5y'] * r['shares'] for r in results)
@@ -420,9 +554,9 @@ if results:
             "5年實收總股息": f"${tot_div_5y_cash:,.2f}",
             "預估年息收入": f"${tot_annual_div:,.2f}",
             "當前股息率 (%)": f"{tot_div_yield:.2f}%",
-            "成本殖利率 (YOC)": f"{tot_yoc_overall:.2f}%"
+            "成本殖利率 (YOC) %": f"{tot_yoc_overall:.2f}%"
         })
-        st.dataframe(pd.DataFrame(div_rows), use_container_width=True, hide_index=True)
+        render_sticky_table(div_rows, div_cols)
 
     # ---------------- 7. 最底層 Footnote 指標定義按鈕 ----------------
     st.markdown("<br><hr style='border: 0.5px solid #2d3748;'>", unsafe_allow_html=True)
@@ -431,12 +565,12 @@ if results:
     def show_footnotes():
         st.markdown("""
         ### 1. 均線與週線動能體質 (Momentum & Trend)
+        * **30週線 (30W MA)**：
+          Stan Weinstein 階段分析法（Stage Analysis）的核心牛熊分水嶺（以過去 150 個交易日簡單均線計算）。若跌破 30W MA，代表中長線轉弱，需提高警覺。
         * **10 / 20 / 30 / 50 / 200 EMA (%)**：
           指數移動平均線（Exponential Moving Average）距離百分比。
           $$\\text{EMA \\%} = \\frac{\\text{現價} - \\text{EMA}}{\\text{EMA}} \\times 100\\%$$
           正數代表股價站在該均線之上，數值愈大短期動能愈強烈。
-        * **30W MA (30週移動平均線)**：
-          Stan Weinstein 階段分析法（Stage Analysis）的核心牛熊分水嶺（以過去 150 個交易日簡單均線計算）。
         * **30W 線動能趨勢 (走近 / 遠離)**：
           比較**「今日乖離率」**與**「兩週前 (10 個交易日前) 乖離率」**的絕對差距變化，以 **2.5%** 作為中長線過濾雜訊的基準閾值：
           * **🚀 擴大遠離 (強勢多頭)**：股價在 30W 線上方，且兩週內加速拋離均線超過 2.5%（主升浪動能增強）。
